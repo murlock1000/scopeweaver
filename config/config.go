@@ -139,6 +139,16 @@ func PostgresDSN() (dsn, source string, err error) {
 	if v := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN")); v != "" {
 		return v, locale.Text(locale.ServerDefault(), "environment variable ARTEX_PG_DSN"), nil
 	}
+	if path := strings.TrimSpace(os.Getenv("ARTEX_PG_DSN_FILE")); path != "" {
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return "", "", locale.Errorf("read ARTEX_PG_DSN_FILE: %w", readErr)
+		}
+		if v := strings.TrimSpace(string(raw)); v != "" {
+			return v, "ARTEX_PG_DSN_FILE", nil
+		}
+		return "", "", locale.NewError("ARTEX_PG_DSN_FILE is empty")
+	}
 	db := Load().Database
 	if d := strings.TrimSpace(db.DSN); d != "" {
 		return d, locale.Text(locale.ServerDefault(), "configuration file ") + Path() + " (database.dsn)", nil

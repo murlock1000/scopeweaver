@@ -182,6 +182,7 @@ var builtinAgents = []builtinAgent{
 	{"planner", "Planner", "planner", "Review the situation and goals, adding exploration intents only for genuinely uncovered directions (one planning loop per task).", []promptVar{
 		{"Goal", "Overall task objective", "Obtain administrator access to example.com", "exploration"},
 		{"AssetSummary", "Asset count/type distribution summary (optional)", "domain:3 ip:5 site:2", "distilled"},
+		{"WorkerCapacity", "Configured concurrent worker capacity", "10", "runtime"},
 	}, false, nil},
 	{"mainagent", "Main agent", "main", "Human interface: observe progress and turn user intent into hints or high-priority intents.", []promptVar{
 		{"Goal", "Current task objective", "Obtain administrator access to example.com", "exploration"},
@@ -241,6 +242,16 @@ ON CONFLICT (agent_id, var_name) DO UPDATE SET
 			return locale.Errorf("seed interactive_shell defaults: %w", err)
 		}
 		_ = d.SetSetting("interactive_shell_default_v1", "true")
+	}
+	// The main agent is a coordinator. Earlier defaults granted it a shell, which
+	// allowed a progress/permission message to turn into a second investigator.
+	// Enforce the role boundary once; workers and the penetration-testing agent
+	// retain their execution tools.
+	if v, _, _ := d.GetSetting("mainagent_coordinator_shell_v2"); v != "true" {
+		if _, err := d.Exec(`UPDATE agents SET interactive_shell=false WHERE key='mainagent'`); err != nil {
+			return locale.Errorf("set mainagent coordinator boundary: %w", err)
+		}
+		_ = d.SetSetting("mainagent_coordinator_shell_v2", "true")
 	}
 	// Seed the built-in browser (Playwright) MCP once — DISABLED by default (users
 	// enable it when needed), no proxy by default. The traffic-capture toggle injects/strips

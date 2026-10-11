@@ -1594,3 +1594,35 @@ export interface InterceptExecution {
   seq: number;
   items: Activity[];
 }
+
+export interface ClusterNode {
+  id: string;
+  display_name: string;
+  owner_name: string;
+  wireguard_ip: string;
+  capacity: number;
+  capabilities: string[];
+  llm_provider: string;
+  llm_model: string;
+  proxy_configured: boolean;
+  egress_ip: string;
+  enabled: boolean;
+  draining: boolean;
+  version: string;
+  online: boolean;
+  last_heartbeat: string;
+}
+
+export interface ClusterWorkerRun {
+  id: number;
+  task_id: number;
+  intent_id: number;
+  execution_node_id: string;
+  container_id: string;
+  worker_name: string;
+  state: string;
+  heartbeat_at: string;
+  started_at: string;
+  finished_at?: string;
+  error: string;
+}

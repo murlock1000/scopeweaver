@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -51,9 +52,13 @@ func main() {
 
 func run() int {
 	var (
-		addr    = flag.String("addr", ":8787", "HTTP listen address")
-		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
-		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		addr        = flag.String("addr", ":8787", "HTTP listen address")
+		dataDir     = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
+		proxy       = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+		mode        = flag.String("mode", "control", "runtime mode: control or executor")
+		nodeID      = flag.String("node-id", os.Getenv("SCOPEWEAVER_NODE_ID"), "executor node identifier")
+		containerID = flag.String("container-id", os.Getenv("SCOPEWEAVER_CONTAINER_ID"), "executor container identifier")
+		slots       = flag.Int("slots", 1, "worker slots in executor mode")
 	)
 	flag.Parse()
 
@@ -111,7 +116,30 @@ func run() int {
 		skillDir = abs
 	}
 	log.Printf(locale.Text(locale.ServerDefault(), "[config] Skill directory: %s"), skillDir)
-	srv := server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
+	var srv *server.Server
+	if *mode == "executor" {
+		if *nodeID == "" {
+			log.Fatal("--node-id is required in executor mode")
+		}
+		cid := *containerID
+		if cid == "" {
+			if host, e := os.Hostname(); e == nil {
+				cid = host
+			}
+		}
+		caps := []string{"worker"}
+		if raw := os.Getenv("SCOPEWEAVER_CAPABILITIES"); raw != "" {
+			caps = strings.Split(raw, ",")
+		}
+		srv = server.NewExecutor(ctx, mgr, skillDir, *dataDir, config.BaseDir(), server.ExecutorOptions{
+			NodeID: *nodeID, ContainerID: cid, DisplayName: envOr("SCOPEWEAVER_NODE_NAME", *nodeID),
+			OwnerName: os.Getenv("SCOPEWEAVER_NODE_OWNER"), WireGuardIP: os.Getenv("SCOPEWEAVER_WIREGUARD_IP"), Capabilities: caps, Slots: *slots,
+		})
+		log.Printf("ScopeWeaver executor node=%s container=%s slots=%d", *nodeID, cid, *slots)
+		<-ctx.Done()
+		return 0
+	}
+	srv = server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
@@ -141,6 +169,13 @@ func run() int {
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
 	return code
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // shutdownContext deliberately does not derive from signalCtx. If it did, the

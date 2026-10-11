@@ -634,7 +634,7 @@ func (s *Server) reseedMainAgentPrompt() {
 // in history. A settings flag permits one attempt; fresh databases already have the latest default.
 // This follows the same structure as reseedGoalsPrompt.
 func (s *Server) reseedPlannerPrompt() {
-	const flag = "planner_prompt_compact_realistic_v2"
+	const flag = "planner_prompt_capacity_target_v4"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -655,7 +655,7 @@ func (s *Server) reseedPlannerPrompt() {
 		log.Printf(locale.Text(locale.ServerDefault(), "[prompts] Could not refresh the planner default: %v"), err)
 		return
 	}
-	log.Print(locale.Text(locale.ServerDefault(), "[prompts] Added planner default with deduplication, depth priority, and bounded negative rechecks (one-time)"))
+	log.Print(locale.Text(locale.ServerDefault(), "[prompts] Added capacity-aware planner default with deduplication and dependency-safe parallelism (one-time)"))
 }
 
 // reseedWorkerPrompt refreshes record_fact guidance: remove the negative-conclusion observation/tentative-reading

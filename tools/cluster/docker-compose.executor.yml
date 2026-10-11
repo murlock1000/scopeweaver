@@ -1,0 +1,27 @@
+services:
+  executor:
+    build:
+      context: ../..
+    image: ${SCOPEWEAVER_IMAGE:-scopeweaver:cluster}
+    command:
+      - -mode
+      - executor
+      - -node-id
+      - ${SCOPEWEAVER_NODE_ID}
+      - -slots
+      - ${SCOPEWEAVER_SLOTS:-1}
+      - -data
+      - /app/data
+      - -proxy
+      - ""
+    env_file:
+      - path: ${SCOPEWEAVER_EXECUTOR_ENV:-/etc/scopeweaver-executor/executor.env}
+        format: raw
+    network_mode: host
+    volumes:
+      - ${SCOPEWEAVER_SHARED_PATH:-/srv/scopeweaver-shared}:/app/data
+      - ../../skills:/app/skills:ro
+      - /etc/scopeweaver-executor/pg-dsn:/run/secrets/pg-dsn:ro
+      - /etc/scopeweaver-executor/llm-api-key:/run/secrets/llm-api-key:ro
+    restart: unless-stopped
+    stop_grace_period: 45s

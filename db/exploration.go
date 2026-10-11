@@ -311,7 +311,12 @@ func (s *ExplorationStore) DeleteGoal(id int64) error {
 // forever in the UI. Workers resume from their transcript, so reopening is safe.
 func (s *ExplorationStore) ResetRunningIntents() (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL
-WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
+WHERE exploration_id=$1 AND kind='intent' AND state='running'
+  AND NOT EXISTS (
+    SELECT 1 FROM cluster_worker_runs r
+    WHERE r.intent_id=exploration_nodes.id AND r.state='running'
+      AND r.heartbeat_at > now() - interval '45 seconds'
+  )`, s.expID)
 	if err != nil {
 		return 0, err
 	}

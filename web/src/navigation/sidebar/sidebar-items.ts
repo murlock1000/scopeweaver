@@ -1,9 +1,9 @@
-import { translate as swt } from "@/i18n/runtime";
 import {
   Activity,
   Ban,
   BellRing,
   Bot,
+  Boxes,
   Brain,
   Bug,
   ClipboardList,
@@ -23,6 +23,8 @@ import {
   Terminal,
   Wrench,
 } from "lucide-react";
+
+import { translate as swt } from "@/i18n/runtime";
 
 export type NavBadge = "new" | "soon";
 
@@ -84,6 +86,7 @@ export const sidebarItems: NavGroup[] = [
     get label() { return swt("interface.m1848"); },
     items: [
       { id: "llm", title: "LLM", url: "/system/llm", icon: Brain },
+      { id: "cluster", title: "Cluster", url: "/system/cluster", icon: Boxes },
       { id: "agents", get title() { return swt("english.e082"); }, url: "/system/agents", icon: Bot },
       { id: "mcp", title: "MCP", url: "/system/mcp", icon: Plug },
       { id: "skills", get title() { return swt("english.e084"); }, url: "/system/skills", icon: Sparkles },

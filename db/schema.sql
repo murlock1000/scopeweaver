@@ -1384,3 +1384,59 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- =====================================================================
+-- N. Cooperative execution cluster.
+--
+-- The ordinary ScopeWeaver server remains the control plane and planner.
+-- Worker-only instances use the same PostgreSQL graph and shared data root,
+-- atomically claim existing intents, and publish their node/container identity.
+-- Provider and VPN credentials deliberately remain node-local.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS cluster_nodes (
+    id              TEXT PRIMARY KEY,
+    display_name    TEXT NOT NULL DEFAULT '',
+    owner_name      TEXT NOT NULL DEFAULT '',
+    wireguard_ip    TEXT NOT NULL DEFAULT '',
+    capacity        INTEGER NOT NULL DEFAULT 1 CHECK (capacity > 0),
+    capabilities    JSONB NOT NULL DEFAULT '[]',
+    llm_provider    TEXT NOT NULL DEFAULT '',
+    llm_model       TEXT NOT NULL DEFAULT '',
+    proxy_configured BOOLEAN NOT NULL DEFAULT false,
+    egress_ip       TEXT NOT NULL DEFAULT '',
+    enabled         BOOLEAN NOT NULL DEFAULT true,
+    draining        BOOLEAN NOT NULL DEFAULT false,
+    version         TEXT NOT NULL DEFAULT '',
+    last_heartbeat  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_nodes_heartbeat ON cluster_nodes(last_heartbeat DESC);
+
+CREATE TABLE IF NOT EXISTS cluster_worker_runs (
+    id                BIGSERIAL PRIMARY KEY,
+    task_id           BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    intent_id         BIGINT NOT NULL,
+    execution_node_id TEXT NOT NULL REFERENCES cluster_nodes(id) ON DELETE RESTRICT,
+    container_id      TEXT NOT NULL,
+    worker_name       TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'running',
+    lease_generation  BIGINT NOT NULL DEFAULT 1,
+    heartbeat_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at       TIMESTAMPTZ,
+    error             TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cluster_worker_active_intent
+    ON cluster_worker_runs(intent_id) WHERE state='running';
+CREATE INDEX IF NOT EXISTS idx_cluster_worker_node ON cluster_worker_runs(execution_node_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cluster_worker_task ON cluster_worker_runs(task_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS cluster_events (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,
+    detail     JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_events_task ON cluster_events(task_id,id);

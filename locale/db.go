@@ -257,6 +257,7 @@ func init() {
 	Register("agent %s var %s: %w", "agent %s var %s: %w", "에이전트 %s 변수 %s: %w")
 	Register("cleanup renamed vars: %w", "cleanup renamed vars: %w", "이름이 변경된 변수 정리 실패: %w")
 	Register("seed interactive_shell defaults: %w", "seed interactive_shell defaults: %w", "interactive_shell 기본값 초기화 실패: %w")
+	Register("set mainagent coordinator boundary: %w", "set mainagent coordinator boundary: %w", "mainagent 조정자 경계 설정 실패: %w")
 	Register("seed browser mcp: %w", "seed browser mcp: %w", "브라우저 MCP 초기화 실패: %w")
 	Register("seed skill visibility: %w", "seed skill visibility: %w", "스킬 공개 범위 초기화 실패: %w")
 	Register("seed intercept rules: %w", "seed intercept rules: %w", "차단 규칙 초기화 실패: %w")

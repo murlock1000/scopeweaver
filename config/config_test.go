@@ -26,6 +26,16 @@ func TestPostgresDSNPrecedence(t *testing.T) {
 		t.Fatalf("env should win, got %q err %v", got, err)
 	}
 
+	// a mounted secret file is used when the direct environment value is absent
+	t.Setenv("ARTEX_PG_DSN", "")
+	dsnFile := filepath.Join(dir, "pg-dsn")
+	os.WriteFile(dsnFile, []byte("postgres://secret-file/db\n"), 0o600)
+	t.Setenv("ARTEX_PG_DSN_FILE", dsnFile)
+	if got, source, err := PostgresDSN(); err != nil || got != "postgres://secret-file/db" || source != "ARTEX_PG_DSN_FILE" {
+		t.Fatalf("secret file: got %q source %q err %v", got, source, err)
+	}
+	t.Setenv("ARTEX_PG_DSN_FILE", "")
+
 	// no env, no file → error (no built-in default)
 	t.Setenv("ARTEX_PG_DSN", "")
 	t.Setenv("ARTEX_CONFIG", filepath.Join(dir, "nope.json"))

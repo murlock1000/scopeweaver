@@ -188,6 +188,19 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 ---
 
+## Cooperative worker cluster
+
+ScopeWeaver can remain a normal single control-plane installation while trusted
+WireGuard-connected servers contribute containerized Worker capacity and their
+own node-local LLM key/proxy. All workers use the canonical PostgreSQL task graph
+and shared data root; only the control plane runs the Planner. Node health,
+container IDs, capacity, provider metadata, and drain controls appear under
+**System → Cluster**.
+
+See [docs/cluster.md](docs/cluster.md) for the control-plane and contributor
+setup scripts, NordVPN proxy separation, shared-storage layout, recovery model,
+and trust boundary.
+
 ## Updating
 
 > Updates swap the program only; your data stays put. The Postgres volume `pgdata`, `./data`

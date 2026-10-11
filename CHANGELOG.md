@@ -4,6 +4,16 @@ This is the translated upstream ARTEX history from baseline `160fe13`, preservin
 
 ## [Unreleased]
 
+### Cooperative worker cluster
+
+#### Added
+
+- Added a standard ScopeWeaver executor mode so trusted WireGuard-connected servers can contribute worker capacity to one control plane while keeping Planner, UI, scheduling, findings and task state centralized.
+- Added durable PostgreSQL node, worker-run and completion-event records. Every remote worker records its execution node and container identity, heartbeats while running, and safely requeues abandoned intents after a stale lease.
+- Added per-node LLM routing and proxy configuration. Contributor API keys stay in root-only files on their own server, and node setup verifies the configured proxy egress before starting workers.
+- Added a Cluster administration page for node health, capacity, current runs, LLM/proxy metadata, draining and enablement controls.
+- Added control-plane and executor setup scripts, shared-storage mounts, verification, draining and removal workflows under `tools/cluster/`, with an operator guide in `docs/cluster.md`.
+
 ### Interception
 
 #### Added

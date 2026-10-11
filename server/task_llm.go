@@ -109,6 +109,13 @@ type taskLLMStreamHooks struct {
 // The returned profile ID is nonzero only for task-chain routing. streamTaskLLM uses it to decide
 // whether quota errors advance task failover; bound/global routes preserve the existing task-chain state.
 func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
+	if r.s.executorMode {
+		prov, cfg, ok := r.s.globalProvider()
+		if !ok {
+			return taskLLMSelection{}, locale.Errorf("executor has no local LLM provider")
+		}
+		return taskLLMSelection{provider: prov, retry: cfg.Retry}, nil
+	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
 		return taskLLMSelection{}, err
@@ -153,6 +160,10 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 // the caller. If failover switches profiles, the change takes effect on the next
 // agent run (a fresh Session is built per run in captureRun).
 func (r *taskLLMRuntime) activeCfg() (agent.Config, bool) {
+	if r.s.executorMode {
+		_, cfg, ok := r.s.globalProvider()
+		return cfg, ok
+	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
 		return agent.Config{}, false
@@ -187,6 +198,33 @@ func (r *taskLLMRuntime) nonStreaming() bool {
 func (r *taskLLMRuntime) maxTokens() int {
 	cfg, _ := r.activeCfg() // Zero when no profile was resolved.
 	return cfg.MaxTokens
+}
+
+// nativeCodexConfig selects the purpose-built local gateway only. Arbitrary
+// OpenAI-compatible profiles (including Ollama) must continue through the
+// existing provider/agentcore implementation.
+func (r *taskLLMRuntime) nativeCodexConfig() (agent.NativeCodexConfig, bool) {
+	cfg, ok := r.activeCfg()
+	if !ok {
+		return agent.NativeCodexConfig{}, false
+	}
+	return nativeCodexFromConfig(cfg)
+}
+
+func nativeCodexFromConfig(cfg agent.Config) (agent.NativeCodexConfig, bool) {
+	if cfg.Format != llm.FormatOpenAI || cfg.SessionHeaderKey != "X-ScopeWeaver-Session" {
+		return agent.NativeCodexConfig{}, false
+	}
+	base := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	endpoint := strings.TrimSuffix(base, "/v1")
+	if endpoint != "http://127.0.0.1:8791" && endpoint != "http://localhost:8791" {
+		return agent.NativeCodexConfig{}, false
+	}
+	effort := strings.TrimSpace(cfg.ReasoningEffort)
+	if effort == "" {
+		effort = "high"
+	}
+	return agent.NativeCodexConfig{Endpoint: endpoint, Model: cfg.Model, ReasoningEffort: effort}, true
 }
 
 func parseTaskID(id string) (int64, error) {
@@ -524,6 +562,10 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 	if t == nil || len(agentKeys) == 0 {
 		return false
 	}
+	if s.executorMode {
+		_, _, ok := s.globalProvider()
+		return ok
+	}
 	state := t.llmStateSnapshot()
 	unboundReady := false
 	if len(state.ProfileIDs) > 0 {
@@ -567,7 +609,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // Read the task's currently active profile streaming flag on each round.
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // The output limit likewise follows the currently active profile.
-	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // Experimental noa compaction: platform-level flag read once per run.
+	wk.SetNativeCodexResolver(workerRuntime.nativeCodexConfig)
+	wk.SetNoaEnabled(s.m.NoaCompactionEnabled) // Experimental noa compaction: platform-level flag read once per run.
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
@@ -577,6 +620,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)
 	pl.SetMaxTokens(plannerRuntime.maxTokens)
+	pl.SetWorkerCapacityResolver(s.m.WorkerCapacity)
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // Experimental noa compaction: platform-level flag read once per run.
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)

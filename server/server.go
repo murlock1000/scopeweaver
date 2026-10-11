@@ -40,9 +40,10 @@ var BuildVersion = "dev"
 // Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
-	m      *Manager
-	engine *Engine
-	ctx    context.Context
+	m            *Manager
+	engine       *Engine
+	ctx          context.Context
+	executorMode bool
 
 	skillDir string // root directory for skill subdirectories
 	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -142,12 +143,26 @@ type triggeredRun struct {
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
 }
 
+type ExecutorOptions struct {
+	NodeID, ContainerID, DisplayName, OwnerName, WireGuardIP string
+	Capabilities                                             []string
+	Slots                                                    int
+}
+
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
+	return newServer(ctx, m, skillDir, dataDir, keyDir, nil)
+}
+
+func NewExecutor(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ExecutorOptions) *Server {
+	return newServer(ctx, m, skillDir, dataDir, keyDir, &opts)
+}
+
+func newServer(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, executor *ExecutorOptions) *Server {
 	key, err := loadOrCreateJWTKey(keyDir, dataDir)
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, executorMode: executor != nil, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -227,19 +242,34 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
-		go s.evidenceStore().RunGC(s.ctx)
-		s.seedPythonInterpreter()     // Detect and store the Python interpreter for custom scripts at startup, only when empty.
-		go newScheduler(s).Run(s.ctx) // P3 timer/finding/goal-event trigger scheduling for custom agents only.
+		if executor == nil {
+			go s.evidenceStore().RunGC(s.ctx)
+		}
+		s.seedPythonInterpreter() // Detect and store the Python interpreter for custom scripts at startup, only when empty.
+		if executor == nil {
+			go newScheduler(s).Run(s.ctx)
+		} // P3 trigger scheduling belongs to the control plane.
 		// Finding notification delivery runs independently beside Scheduler: its three-second responsiveness
 		// differs from trigger scheduling, and a stuck delivery must not block agent triggers.
-		go newNotifier(s).Run(s.ctx)
+		if executor == nil {
+			go newNotifier(s).Run(s.ctx)
+		}
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
+		if executor == nil {
+			go s.discoverEmptyMCPsOnStartup()
+		}
 		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
 	}
-	// precedence: persisted DB config > env.
-	if cfg, ok := s.loadLLMConfig(); ok {
+	// Worker nodes keep their contributed key and proxy local. The ordinary
+	// control plane retains persisted-profile precedence.
+	if executor != nil {
+		if cfg, ok := agent.FromEnv(); ok {
+			if err := s.applyLLM(cfg); err != nil {
+				log.Printf("[executor] env LLM init failed: %v", err)
+			}
+		}
+	} else if cfg, ok := s.loadLLMConfig(); ok {
 		if err := s.applyLLM(cfg); err != nil {
 			log.Printf("[engine] saved LLM config init failed — engine idle: %v", err)
 		} else {
@@ -254,11 +284,78 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
-	s.restoreTaskRuntimes()
-	go s.reconcileConcurrency()
-	s.startTaskArchiveWorker()
-	s.wireInterceptReviewer() // LLM fallback approval judges commands that match no interception rule.
+	if executor != nil {
+		s.startExecutor(*executor)
+	} else {
+		s.restoreTaskRuntimes()
+		go s.clusterWakeLoop()
+		go s.reconcileConcurrency()
+		s.startTaskArchiveWorker()
+		s.wireInterceptReviewer() // LLM fallback approval judges commands that match no interception rule.
+	}
 	return s
+}
+
+func (s *Server) clusterWakeLoop() {
+	// Events that predate this control-plane process are already reflected in the
+	// canonical task graph loaded during restoreTaskRuntimes. Starting at the
+	// current tail avoids replaying the full event history (and needlessly waking
+	// planners) after every restart.
+	cursor := s.m.pg.LatestClusterEventID(s.ctx)
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-tick.C:
+			_, _ = s.m.pg.RecoverStaleClusterRuns(s.ctx, 45*time.Second)
+			events, err := s.m.pg.ClusterEventsAfter(s.ctx, cursor)
+			if err != nil {
+				continue
+			}
+			for _, event := range events {
+				if event.ID > cursor {
+					cursor = event.ID
+				}
+				if t, ok := s.m.Task(strconv.FormatInt(event.TaskID, 10)); ok {
+					t.Notify()
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) startExecutor(opts ExecutorOptions) {
+	if opts.Slots < 1 {
+		opts.Slots = 1
+	}
+	if opts.ContainerID == "" {
+		opts.ContainerID = "host"
+	}
+	s.engine.SetExecutionIdentity(opts.NodeID, opts.ContainerID)
+	s.engine.RunExecutorPool(s.ctx, opts.Slots)
+	capJSON, _ := json.Marshal(opts.Capabilities)
+	register := func() {
+		cfg, _ := agent.FromEnv()
+		_ = s.m.pg.UpsertClusterNode(s.ctx, db.ClusterNode{ID: opts.NodeID, DisplayName: opts.DisplayName, OwnerName: opts.OwnerName,
+			WireGuardIP: opts.WireGuardIP, Capacity: opts.Slots, Capabilities: capJSON, LLMProvider: cfg.Provider(), LLMModel: cfg.Model,
+			ProxyConfigured: strings.TrimSpace(cfg.Proxy) != "", EgressIP: os.Getenv("SCOPEWEAVER_EGRESS_IP"), Version: BuildVersion})
+		s.m.LoadExisting() // also refreshes mutable lifecycle state for known tasks.
+	}
+	register()
+	go func() {
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-tick.C:
+				register()
+			}
+		}
+	}()
 }
 
 // Restored deadline and worker loops must inherit the same context as new tasks,
@@ -431,9 +528,14 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	var prov llm.Provider
 	// A persisted active profile must use the same cached provider as task chains
 	// and Agent bindings, otherwise each path owns a separate rate limiter.
-	if active, _ := s.m.pg.ActiveProfile(); active != nil {
-		if activeCfg, ok := s.loadProfileConfig(active.ID); ok && activeCfg == cfg {
-			prov, _, _ = s.providerForProfile(active.ID)
+	// Executors are deliberately excluded: their provider, secret and proxy are
+	// node-local and must never be replaced by credentials from shared PostgreSQL.
+	if !s.executorMode {
+		active, _ := s.m.pg.ActiveProfile()
+		if active != nil {
+			if activeCfg, ok := s.loadProfileConfig(active.ID); ok && activeCfg == cfg {
+				prov, _, _ = s.providerForProfile(active.ID)
+			}
 		}
 	}
 	if prov == nil {
@@ -455,8 +557,11 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// LLM failover, disabled by default, wraps the active profile in a chain and switches when unavailable.
 	// This affects only global-active routing. Agent bindings/task pins use providerForProfile and remain
 	// exclusive by default (see poolForBinding). Disabled/no alternatives returns the original provider.
-	if act, err := s.m.pg.ActiveProfile(); err == nil && act != nil {
-		prov = s.poolForActive(act.ID, prov, cfg)
+	if !s.executorMode {
+		act, err := s.m.pg.ActiveProfile()
+		if err == nil && act != nil {
+			prov = s.poolForActive(act.ID, prov, cfg)
+		}
 	}
 	// No global planner/worker pair: every task runs on its own task-routed pair
 	// (agentsForTask), resolved through the engine's authoritative resolver. Global
@@ -652,6 +757,7 @@ func (s *Server) chatAgentRef() *agent.ChatAgent {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerSideRoutes(mux)
+	s.registerClusterRoutes(mux)
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)

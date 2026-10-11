@@ -86,6 +86,9 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// nativeCodex resolves the local persistent app-server worker mode. When it
+	// returns false, Worker uses the original provider/agentcore loop unchanged.
+	nativeCodex func() (NativeCodexConfig, bool)
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -127,6 +130,13 @@ func (w *Worker) SetNoaEnabled(fn func() bool) { w.noaEnabledFn = fn }
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
 // send no cap and let the endpoint decide. Read per run, like nonStreaming.
 func (w *Worker) SetMaxTokens(fn func() int) { w.maxTokensFn = fn }
+
+// SetNativeCodexResolver enables the Codex-specific persistent worker backend
+// for matching profiles. It is evaluated on every run so changing the Worker
+// binding to Ollama or another provider immediately restores the standard path.
+func (w *Worker) SetNativeCodexResolver(fn func() (NativeCodexConfig, bool)) {
+	w.nativeCodex = fn
+}
 
 func (w *Worker) maxTokens() int {
 	if w.maxTokensFn == nil {
@@ -509,6 +519,30 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		} else {
 			input += "\n\n" + workerChatMarker(requestID) + locale.Text(locale.FromContext(ctx), "\n[New intent from the human conversation]\n") + message +
 				locale.Text(locale.FromContext(ctx), "\n\nPrioritize this human input.")
+		}
+	}
+
+	// The local Codex gateway can own the repeated model/tool loop inside one
+	// app-server turn. ScopeWeaver still executes every tool through the same
+	// permission checks, hooks, capture proxy, graph tools, and live activity
+	// stream. Other LLM profiles continue below through agentcore unchanged.
+	if w.nativeCodex != nil {
+		if nativeCfg, ok := w.nativeCodex(); ok {
+			nativeCtx := ctx
+			var cancel context.CancelFunc
+			if maxDur > 0 {
+				nativeCtx, cancel = context.WithTimeout(ctx, maxDur)
+				defer cancel()
+			}
+			nativeSystem := strings.Join(append(system, outputLanguageInstruction(locale.FromContext(ctx))), "\n\n")
+			reason, err := runNativeCodexWorker(
+				nativeCtx, nativeCfg, nativeWorkerSessionID(ts.ID(), name), nativeSystem,
+				input, name, runDir, tools, hooks, emitWrap, proxyEnv(w.proxyAddr, w.proxyCACert),
+			)
+			if err != nil && nativeCtx.Err() == context.DeadlineExceeded {
+				reason = harness.ReasonTimeout
+			}
+			return reason, tsx.Writes(), err
 		}
 	}
 

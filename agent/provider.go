@@ -147,6 +147,12 @@ func FromEnv() (Config, bool) {
 	prov := os.Getenv("ARTEX_LLM_PROVIDER")
 	anthKey := os.Getenv("ANTHROPIC_API_KEY")
 	oaiKey := os.Getenv("OPENAI_API_KEY")
+	if anthKey == "" {
+		anthKey = credentialFile("ANTHROPIC_API_KEY_FILE")
+	}
+	if oaiKey == "" {
+		oaiKey = credentialFile("OPENAI_API_KEY_FILE")
+	}
 
 	if prov == "" {
 		switch {
@@ -190,6 +196,18 @@ func FromEnv() (Config, bool) {
 		return Config{}, false
 	}
 	return c, true
+}
+
+func credentialFile(env string) string {
+	path := strings.TrimSpace(os.Getenv(env))
+	if path == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 // ConfigFrom builds a Config from UI-provided strings (provider defaults to

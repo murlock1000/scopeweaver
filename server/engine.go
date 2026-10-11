@@ -152,6 +152,11 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+
+	// executionNode/container identify worker-only cluster processes. Empty node
+	// means the ordinary embedded workers on the control plane.
+	executionNode string
+	containerID   string
 }
 
 type taskRuntime struct {
@@ -768,13 +773,91 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
 	}
 	e.startDeadlineCoordinator(ctx, t) // Deduplicated task deadline timer, only when timeout>0.
-	// Kick initial planning only when there are no open or running intents. Seed intents may still be open
-	// or already claimed by the workers started above; both mean work exists, so skip initial planning.
-	// Workers execute seeds directly, then NotifyDone or the heartbeat wakes the planner.
-	// Do not use Frontier, which counts only open intents: claiming open->running races this check.
-	// Automatic recovery after restart may also have only running intents and should likewise skip planning.
-	if has, _ := t.Store.HasActiveIntent(); !has {
-		t.Notify() // kick the first planning round (acted on once LLM is ready)
+	// Always run one initial planning round. The planner sees the full open/running
+	// frontier and deduplicates against it, so seeded and recovered work is kept;
+	// the round can also fill unused capacity when the configured worker pool is
+	// larger than the saved frontier. Without this nudge, recovered tasks wait for
+	// a worker completion or the heartbeat before newly added capacity is usable.
+	t.Notify()
+}
+
+// SetExecutionIdentity labels subsequently started worker loops and their durable
+// run records. It is called once before RunWorkersOnly in executor mode.
+func (e *Engine) SetExecutionIdentity(nodeID, containerID string) {
+	e.executionNode, e.containerID = nodeID, containerID
+}
+
+// RunWorkersOnly attaches N real Worker loops to an existing task without
+// starting a second Planner or deadline coordinator. PostgreSQL's atomic intent
+// claim is the cross-process work queue.
+func (e *Engine) RunWorkersOnly(ctx context.Context, t *Task, workers int) {
+	if workers < 1 {
+		workers = 1
+	}
+	ctx = locale.WithLang(ctx, taskLanguage(e.m.pg, t.ID))
+	key := "remote:" + e.executionNode + ":" + e.containerID + ":" + t.ID
+	if _, loaded := e.started.LoadOrStore(key, true); loaded {
+		return
+	}
+	rt := e.registerTaskRoutines(ctx, key, workers)
+	for i := 0; i < workers; i++ {
+		name := fmt.Sprintf("%s/%s/work#%d", e.executionNode, e.containerID, i+1)
+		runTaskRoutine(rt, func(loopCtx context.Context) { e.workerLoop(loopCtx, t, name) })
+	}
+}
+
+// RunExecutorPool starts a node-wide worker pool. Capacity is shared across all
+// tasks instead of being multiplied by the number of active tasks.
+func (e *Engine) RunExecutorPool(ctx context.Context, workers int) {
+	if workers < 1 {
+		workers = 1
+	}
+	key := "executor-pool:" + e.executionNode + ":" + e.containerID
+	if _, loaded := e.started.LoadOrStore(key, true); loaded {
+		return
+	}
+	rt := e.registerTaskRoutines(ctx, key, workers)
+	for i := 0; i < workers; i++ {
+		name := fmt.Sprintf("%s/%s/work#%d", e.executionNode, e.containerID, i+1)
+		runTaskRoutine(rt, func(loopCtx context.Context) { e.executorWorkerLoop(loopCtx, name) })
+	}
+}
+
+func (e *Engine) executorWorkerLoop(ctx context.Context, name string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if !e.m.pg.ClusterNodeRunnable(ctx, e.executionNode) {
+			if sleepCtx(ctx, 2*time.Second) {
+				return
+			}
+			continue
+		}
+		claimed := false
+		for _, t := range e.m.List() {
+			lc := t.lifecycleSnapshot()
+			if lc.Queued || lc.Paused || isTerminalStatus(lc.Status) || e.IsDeleting(t.ID) {
+				continue
+			}
+			_, worker := e.snapshotFor(t)
+			if worker == nil {
+				continue
+			}
+			if !e.beginTaskOperation(t.ID) {
+				continue
+			}
+			claimed = e.runWorkerStep(ctx, t, name, worker)
+			e.decInflight(t.ID)
+			if claimed {
+				break
+			}
+		}
+		if !claimed && sleepCtx(ctx, 800*time.Millisecond) {
+			return
+		}
 	}
 }
 
@@ -922,6 +1005,12 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			return
 		default:
 		}
+		if e.executionNode != "" && !e.m.pg.ClusterNodeRunnable(ctx, e.executionNode) {
+			if sleepCtx(ctx, 2*time.Second) {
+				return
+			}
+			continue
+		}
 		_, worker := e.snapshotFor(t)
 		if worker == nil {
 			if sleepCtx(ctx, 1500*time.Millisecond) {
@@ -970,7 +1059,48 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 		return false
 	}
 	log.Printf(locale.Text(locale.FromContext(ctx), "[worker %s] task %s claimed intent #%d"), name, t.ID, intent.ID)
-	return e.runIntent(ctx, t, name, worker, intent, "", "")
+	var runID int64
+	if e.executionNode != "" {
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		var err error
+		runID, err = e.m.pg.StartClusterWorkerRun(ctx, taskID, intent.ID, e.executionNode, e.containerID, name)
+		if err != nil || runID == 0 {
+			// A remote run without a durable lease cannot be recovered or fenced.
+			// Release the just-claimed intent instead of executing invisible work.
+			if releaseErr := transitionIntentState(t.Store, intent.ID, "running", "open"); releaseErr != nil {
+				log.Printf("[cluster] could not release unregistered intent #%d: %v", intent.ID, releaseErr)
+			}
+			if err != nil {
+				log.Printf("[cluster] could not register worker run for intent #%d: %v", intent.ID, err)
+			}
+			return true
+		}
+	}
+	done := make(chan struct{})
+	if runID > 0 {
+		go func() {
+			tick := time.NewTicker(10 * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-tick.C:
+					_ = e.m.pg.HeartbeatClusterWorkerRun(context.Background(), runID)
+				}
+			}
+		}()
+	}
+	result := e.runIntent(ctx, t, name, worker, intent, "", "")
+	close(done)
+	if runID > 0 {
+		state := "completed"
+		if current, err := t.Store.GetNode(intent.ID); err == nil && current != nil && current.State != "" {
+			state = current.State
+		}
+		_ = e.m.pg.FinishClusterWorkerRun(context.Background(), runID, state, "")
+	}
+	return result
 }
 
 // runIntent executes and fully settles one already-claimed (state=running) intent.

@@ -1,7 +1,6 @@
 
 import { localizedFetch as fetch } from "@/i18n/request";
-import { localizedUrl } from "@/i18n/runtime";
-import { translate as swt } from "@/i18n/runtime";
+import { localizedUrl, translate as swt } from "@/i18n/runtime";
 // Real backend client. /api/* is proxied to the Go backend (next.config rewrites).
 // Returns the domain types in lib/types.ts. Shapes match the backend handlers;
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
@@ -24,6 +23,8 @@ import type {
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
+  ClusterNode,
+  ClusterWorkerRun,
   CommandRecord,
   Company,
   CompanyScopeMutation,
@@ -210,6 +211,12 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
 export const api = {
   // Backend application version injected via release ldflags, defaulting to dev.
   health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+
+  clusterNodes: () => get<{ nodes: ClusterNode[] }>("/cluster/nodes").then((r) => arr(r.nodes)),
+  clusterRuns: () => get<{ runs: ClusterWorkerRun[] }>("/cluster/runs").then((r) => arr(r.runs)),
+  updateClusterNode: (id: string, state: { enabled?: boolean; draining?: boolean }) =>
+    patch<{ ok: boolean }>(`/cluster/nodes/${encodeURIComponent(id)}`, state),
+  deleteClusterNode: (id: string) => del<{ ok: boolean }>(`/cluster/nodes/${encodeURIComponent(id)}`),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -327,6 +328,13 @@ func (m *Manager) Workers() int {
 		return defaultWorkers
 	}
 	return n
+}
+
+// WorkerCapacity is the Planner-facing capacity: embedded workers plus every
+// healthy contributed executor. The engine still uses Workers() for its local
+// pool, so remote slots are never accidentally spawned on the control plane.
+func (m *Manager) WorkerCapacity() int {
+	return m.Workers() + m.pg.ClusterWorkerCapacity(context.Background())
 }
 
 // SetWorkers persists the concurrent work-agent count. Values <=0 are rejected.
@@ -1101,7 +1109,24 @@ func (m *Manager) LoadExisting() []*Task {
 	var loaded []*Task
 	for _, pt := range pts {
 		id := strconv.FormatInt(pt.ID, 10)
-		if _, ok := m.tasks[id]; ok {
+		if existing, ok := m.tasks[id]; ok {
+			existing.updateLifecycle(func(state *taskLifecycleState) {
+				state.Name = pt.Name
+				state.PinnedAt = unixOrZero(pt.PinnedAt)
+				state.Status = pt.Status
+				state.Paused = pt.Paused
+				state.Queued = pt.Queued
+				state.QueuedAt = unixNanoOrZero(pt.QueuedAt)
+				state.QueueMode = pt.QueueMode
+				state.CompletedAt = unixOrZero(pt.CompletedAt)
+				state.FirstRunAt = unixOrZero(pt.FirstRunAt)
+				state.DeadlineAt = unixOrZero(pt.DeadlineAt)
+				state.SourceTaskIDs = append([]int64(nil), pt.SourceTaskIDs...)
+				state.CompanyIDs = append([]int64(nil), pt.CompanyIDs...)
+				state.CategoryID = cloneInt64Ptr(pt.CategoryID)
+				state.CategoryName = pt.CategoryName
+			})
+			existing.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
 			continue
 		}
 		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
